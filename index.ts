@@ -563,6 +563,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 								text: `Unknown agent "${params.agent}". Available agents:\n${formatAgentList(agents)}`,
 							},
 						],
+						details: {},
 					};
 				}
 
@@ -574,6 +575,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 								text: `${config.maxConcurrent} subagents are already running. Wait for one to finish, or raise maxConcurrent in ~/.pi/agent/subagents/config.json.`,
 							},
 						],
+						details: {},
 					};
 				}
 
@@ -583,7 +585,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 						`Agent: ${agent.name}\nSource: ${agent.filePath}\n\nProject agents come from the repository. Only continue for trusted code.`,
 					);
 					if (!ok) {
-						return { content: [{ type: "text" as const, text: "Cancelled: project agent was not approved." }] };
+						return { content: [{ type: "text" as const, text: "Cancelled: project agent was not approved." }], details: {} };
 					}
 				}
 
@@ -597,6 +599,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 								text: "`worktree` and `cwd` are mutually exclusive: a worktree chooses its own directory.",
 							},
 						],
+						details: {},
 					};
 				}
 
@@ -621,11 +624,12 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 									}`,
 								},
 							],
+							details: {},
 						};
 					}
 				}
 				if (!fs.existsSync(cwd)) {
-					return { content: [{ type: "text" as const, text: `Working directory does not exist: ${cwd}` }] };
+					return { content: [{ type: "text" as const, text: `Working directory does not exist: ${cwd}` }], details: {} };
 				}
 
 				const model = params.model ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
@@ -638,6 +642,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 				} catch (error) {
 					return {
 						content: [{ type: "text" as const, text: `Could not start subagent: ${String(error)}` }],
+						details: {},
 					};
 				}
 
@@ -694,9 +699,13 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 									text: `Message ${disposition === "queued" ? "queued for" : "delivered to"} "${params.name}". Its eventual result still arrives as a message.`,
 								},
 							],
+							details: {},
 						};
 					} catch (error) {
-						return { content: [{ type: "text" as const, text: `Could not reach "${params.name}": ${String(error)}` }] };
+						return {
+							content: [{ type: "text" as const, text: `Could not reach "${params.name}": ${String(error)}` }],
+							details: {},
+						};
 					}
 				}
 
@@ -710,6 +719,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 								text: `No subagent named "${params.name}".${known.length ? ` Known names: ${known.join(", ")}.` : ""} Start one with the subagent tool.`,
 							},
 						],
+						details: {},
 					};
 				}
 
@@ -723,11 +733,12 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 								text: `Agent definition "${record.agent}" is no longer available, so "${params.name}" cannot be resumed.`,
 							},
 						],
+						details: {},
 					};
 				}
 
-				const resumeCwd = fs.existsSync(record.cwd) ? record.cwd : ctx.cwd;
-				const worktreeGone = Boolean(record.worktreePath) && !fs.existsSync(record.worktreePath);
+				const resumeCwd = record.cwd && fs.existsSync(record.cwd) ? record.cwd : ctx.cwd;
+				const worktreeGone = record.worktreePath ? !fs.existsSync(record.worktreePath) : false;
 				const resumed = createRun({
 					agent,
 					task: params.message,
@@ -746,6 +757,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 							}. Its reply will arrive as a new message.`,
 						},
 					],
+					details: {},
 				};
 			},
 		});
@@ -763,11 +775,12 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 				rememberCtx(ctx);
 				const run = runs.get(params.name);
 				if (!run || run.isTerminal) {
-					return { content: [{ type: "text" as const, text: `"${params.name}" is not running.` }] };
+					return { content: [{ type: "text" as const, text: `"${params.name}" is not running.` }], details: {} };
 				}
 				void run.cancel(params.reason ?? "cancelled by the main agent");
 				return {
 					content: [{ type: "text" as const, text: `Stopping "${params.name}". Its partial result will arrive as a message.` }],
+					details: {},
 				};
 			},
 		});
@@ -804,6 +817,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 								text: `Cleanup failed: ${error instanceof WorktreeError ? error.message : String(error)}`,
 							},
 						],
+						details: {},
 					};
 				}
 			},
@@ -856,7 +870,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 				}
 			}
 
-			return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: {} };
 		},
 	});
 

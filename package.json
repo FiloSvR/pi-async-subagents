@@ -1,0 +1,29 @@
+{
+	"name": "pi-async-subagents",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Async, liveness-checked subagents for pi: background runs, worktrees, cleanup",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^24.0.0",
+		"typescript": "^5.6.0"
+	},
+	"scripts": {
+		"host": "./setup-node-modules.sh ${PI_HOST_NODE_MODULES:-}",
+		"typecheck": "tsc --noEmit",
+		"test": "./scripts/test.sh",
+		"check": "./scripts/check.sh",
+		"smoke": "node scripts/smoke.ts"
+	},
+	"engines": {
+		"node": ">=22.6"
+	}
+}

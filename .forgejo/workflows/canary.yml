@@ -1,0 +1,31 @@
+name: pi-canary
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+jobs:
+  latest:
+    runs-on: docker
+    timeout-minutes: 20
+    container:
+      image: docker.io/library/node:24.18.0-trixie
+    steps:
+      - name: checkout
+        run: |
+          git init -q .
+          git -c http.extraHeader="Authorization: token ${{ github.token }}" \
+            fetch -q --depth=1 "${CI_GIT_URL:-${{ github.server_url }}}/${{ github.repository }}.git" "${{ github.ref }}"
+          git checkout -q FETCH_HEAD
+          git log -1 --oneline
+      - name: install
+        run: npm ci
+      - name: latest host packages
+        run: |
+          HOST="$RUNNER_TEMP/pi-host"
+          npm install --prefix "$HOST" --no-save --include=peer \
+            @earendil-works/pi-coding-agent@latest typebox
+          echo "PI_HOST_NODE_MODULES=$HOST/node_modules" >> "$GITHUB_ENV"
+      - name: check against latest pi
+        run: npm run check
+      - name: smoke against latest pi
+        run: PI_CLI="$PI_HOST_NODE_MODULES/.bin/pi" npm run smoke

@@ -1,0 +1,32 @@
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+jobs:
+  check:
+    runs-on: docker
+    timeout-minutes: 20
+    container:
+      image: docker.io/library/node:24.18.0-trixie
+    steps:
+      - name: checkout
+        run: |
+          git init -q .
+          git -c http.extraHeader="Authorization: token ${{ github.token }}" \
+            fetch -q --depth=1 "${CI_GIT_URL:-${{ github.server_url }}}/${{ github.repository }}.git" "${{ github.ref }}"
+          git checkout -q FETCH_HEAD
+          git log -1 --oneline
+      - name: install
+        run: npm ci
+      - name: host packages
+        run: |
+          HOST="$RUNNER_TEMP/pi-host"
+          npm install --prefix "$HOST" --no-save --include=peer \
+            @earendil-works/pi-coding-agent@1.4.0 typebox
+          echo "PI_HOST_NODE_MODULES=$HOST/node_modules" >> "$GITHUB_ENV"
+      - name: check (typecheck + offline tests)
+        run: npm run check
+      - name: smoke (real pi RPC, zero tokens)
+        run: PI_CLI="$PI_HOST_NODE_MODULES/.bin/pi" npm run smoke

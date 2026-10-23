@@ -9,6 +9,27 @@ This replaces Pi's bundled `examples/extensions/subagent`, which awaits the chil
 inside the tool call, so the main agent is stuck until the child exits, and a
 child that stops making progress hangs the tool call until you abort.
 
+## Install
+
+This is a Pi package. Install it from this repository's git URL, pinned to a
+tag:
+
+```bash
+pi install git:<this-repository>@v0.1.0
+pi list
+```
+
+Then remove any hand-placed copy at `~/.pi/agent/extensions/subagent` so the
+same extension does not load twice. Keep a source checkout for development;
+`pi update --extensions` reconciles the package, and the tag pins it.
+
+The package declares the host packages (`@earendil-works/pi-coding-agent`,
+`typebox`) as `peerDependencies: "*"`; Pi supplies them. Do not add them to
+`dependencies`: a physical copy bypasses Pi's extension module mapping.
+
+For a local working tree, `pi install /path/to/pi-async-subagents` loads it from
+the resolved path without copying.
+
 ## How it works
 
 ```
@@ -184,10 +205,9 @@ shows what would go.
 ## Development
 
 ```bash
-./setup-node-modules.sh          # link host packages for standalone tests
-node --test test/*.test.ts       # 54 tests, no model calls, no API keys
-# optional typecheck if TypeScript is installed:
-# npx -y tsc -p tsconfig.json
+npm install                    # TypeScript and @types/node; host packages are peers
+./setup-node-modules.sh        # link the host Pi packages for the tests
+npm run check                  # typecheck + 54 tests, no model calls, no API keys
 ```
 
 The tests use a scripted fake RPC child (`test/fake-pi.mjs`), not a model, so
@@ -199,27 +219,17 @@ covers timeouts/stalls/kill, `registry.test.ts` covers names and persistence,
 A zero-token smoke test against the real CLI:
 
 ```bash
-node --input-type=module -e '
-import { ChildRpc } from "./rpc.ts";
-const rpc = new ChildRpc({
-  command: process.execPath,
-  args: [process.env.PI_CLI ?? "pi", "--mode", "rpc", "--no-session"],
-  cwd: process.cwd(),
-  env: { ...process.env },
-});
-await rpc.start(); console.log(await rpc.send({ type: "get_state" })); await rpc.stop();
-'
+npm run smoke                  # PI_CLI=/path/to/pi to pick the binary
 ```
 
-## Removing / going back
+## Upgrade and remove
 
-This directory used to be symlinks into Pi's bundled example. To restore them:
+The package is pinned to a tag. `pi update --extensions` reconciles it; to roll
+back, install the previous tag. To remove it, `pi remove <source>`. The child
+sessions under `~/.pi/agent/subagents` are yours to delete separately.
 
-```bash
-D=$(dirname "$(readlink -f "$(command -v pi)")")/../lib/node_modules/@earendil-works/pi-coding-agent
-rm -rf ~/.pi/agent/extensions/subagent
-ln -s "$D/examples/extensions/subagent" ~/.pi/agent/extensions/subagent
-```
+The source checkout is for development only; the running extension comes from
+the installed package.
 
-(Correct the path for your install layout; for the managed installer the example
-lives at `~/.pi/agent/install/releases/<version>/node_modules/@earendil-works/pi-coding-agent/examples/extensions/subagent`.)
+Compatibility surfaces and the upgrade checklist live in `docs/compat.md`; the
+weekly `pi-canary` workflow runs the same checks against `@latest`.
