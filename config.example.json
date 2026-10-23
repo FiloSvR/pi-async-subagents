@@ -1,0 +1,9 @@
+{
+	"stallSeconds": 120,
+	"abortAfterSeconds": 600,
+	"maxRunMinutes": 60,
+	"settleGraceSeconds": 15,
+	"uiPolicy": "deny",
+	"maxDepth": 1,
+	"maxConcurrent": 6
+}
