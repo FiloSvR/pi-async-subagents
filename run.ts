@@ -151,29 +151,24 @@ export class SubagentRun {
 		});
 
 		try {
-			await this.rpc.start();
-		} catch (error) {
-			this.finalize("failed", describe(error));
-			return;
-		}
-
-		this.status = "running";
-		this.touch("thinking");
-		this.watchdog = setInterval(() => this.tick(), WATCHDOG_MS);
-		if (typeof this.watchdog === "object" && "unref" in this.watchdog) this.watchdog.unref();
-
-		this.unsubscribe = this.rpc.onEvent((event) => this.onEvent(event));
-
-		try {
-			const state = (await this.rpc.send({ type: "get_state" }, 15_000)) as {
+			const state = (await this.rpc.start()) as {
 				sessionId?: string;
 				sessionFile?: string;
 			} | null;
 			if (state?.sessionId) this.sessionId = state.sessionId;
 			if (state?.sessionFile) this.sessionFile = state.sessionFile;
-		} catch {
-			// State is a nicety (resume, widget); the run can proceed without it.
+		} catch (error) {
+			this.finalize("failed", describe(error));
+			return;
 		}
+
+		// Spawn time is not model idle time: reset the clock once the child is up.
+		this.lastActivityAt = Date.now();
+		this.touch("sending task");
+		this.watchdog = setInterval(() => this.tick(), WATCHDOG_MS);
+		if (typeof this.watchdog === "object" && "unref" in this.watchdog) this.watchdog.unref();
+
+		this.unsubscribe = this.rpc.onEvent((event) => this.onEvent(event));
 
 		try {
 			const data = (await this.rpc.send({ type: "prompt", message: this.task }, 60_000)) as {
@@ -182,6 +177,12 @@ export class SubagentRun {
 			if (data?.disposition === "handled") {
 				// An extension command consumed the prompt; no model run will follow.
 				this.finalize("finished");
+			}
+			// The child is only "running" once it accepted the task.
+			if (!this.isTerminal) {
+				this.status = "running";
+				this.touch("waiting for model");
+				this.emitUpdate();
 			}
 			this.resolveReady();
 		} catch (error) {
@@ -524,6 +525,7 @@ export function formatTokens(count: number): string {
 export function usageLine(usage: RunUsage): string {
 	const parts: string[] = [];
 	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns === 1 ? "" : "s"}`);
+	if (usage.contextTokens) parts.push(`ctx ${formatTokens(usage.contextTokens)}`);
 	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
 	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
 	if (usage.cost) parts.push(`$${usage.cost.toFixed(2)}`);

@@ -3,7 +3,9 @@
 	"abortAfterSeconds": 600,
 	"maxRunMinutes": 60,
 	"settleGraceSeconds": 15,
+	"finishedVisibleSeconds": 30,
 	"uiPolicy": "deny",
+	"resultDisplay": "summary",
 	"maxDepth": 1,
 	"maxConcurrent": 6
 }

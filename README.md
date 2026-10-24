@@ -28,7 +28,8 @@ The package declares the host packages (`@earendil-works/pi-coding-agent`,
 `dependencies`: a physical copy bypasses Pi's extension module mapping.
 
 For a local working tree, `pi install /path/to/pi-async-subagents` loads it from
-the resolved path without copying.
+the resolved path without copying. After changing the source in a running
+session, run `/reload` (or restart Pi) to load the new code.
 
 ## How it works
 
@@ -46,6 +47,21 @@ parent Pi ── subagent tool ──▶ ChildRpc ──▶ pi --mode rpc (child
   { triggerTurn: true, deliverAs: "followUp" })`.
 - Child sessions are persisted under `~/.pi/agent/subagents/sessions`, so a
   finished subagent can be resumed by name with its whole context intact.
+
+## Display
+
+The widget above the editor lists running subagents, plus finished ones for
+`finishedVisibleSeconds` (default 30) so the outcome stays visible briefly.
+After that window the finished entries disappear; when nothing is running or
+recently finished, the widget and its status clear. Every row also shows the
+child's model and current context size, e.g. `openrouter/z-ai/glm-5.3-flash · ctx 12.3k`.
+
+Each delivered result is a custom message that stays in the transcript, but it
+is collapsed to one status line (`[subagent] name · finished · duration · usage`).
+Press `Ctrl+O` to expand it to the full output and resume hint. Failures and
+cancellations keep their reason visible even while collapsed. Set
+`"resultDisplay": "hidden"` to keep completed results out of the transcript
+entirely; the agent still receives them and can summarise.
 
 ## Tools
 
@@ -123,7 +139,9 @@ The body becomes the child's system prompt.
 	"abortAfterSeconds": 600,
 	"maxRunMinutes": 60,
 	"settleGraceSeconds": 15,
+	"finishedVisibleSeconds": 30,
 	"uiPolicy": "deny",
+	"resultDisplay": "summary",
 	"maxDepth": 1,
 	"maxConcurrent": 6
 }
@@ -135,7 +153,9 @@ The body becomes the child's system prompt.
 | `abortAfterSeconds` | Silence after which the run is **aborted**, then killed if it ignores the abort. |
 | `maxRunMinutes` | Hard cap on one run regardless of activity. |
 | `settleGraceSeconds` | How long an aborted child gets to report its own settlement before `SIGTERM`/`SIGKILL`. |
+| `finishedVisibleSeconds` | How long a finished subagent stays in the widget. Default `30`. |
 | `uiPolicy` | `deny` (default) answers child dialogs with `cancelled: true`; `allow` answers `confirm: yes`, the first `select` option, and empty `input`/`editor`. |
+| `resultDisplay` | `summary` (default) puts one collapsed line per result in the transcript; `full` restores the complete message; `hidden` keeps results out of the transcript entirely (the agent still receives them). |
 | `maxDepth` | Subagent nesting. `1` means a child cannot spawn its own subagents. |
 | `maxConcurrent` | Maximum running subagents per session. |
 
@@ -153,7 +173,9 @@ has explicit terms:
    blocking forever.
 2. **Stall detection.** A 1s watchdog tracks the last event of any kind
    (`message_end`, `tool_execution_*`, `bash_execution_update`, …). Runs show
-   `stalled` with idle time in the widget.
+   `stalled` with idle time in the widget. Child startup is not counted as
+   idle: a run stays `starting` until the child accepts the prompt, then its
+   activity clock begins.
 3. **Abort, then kill.** At `abortAfterSeconds` the run gets `abort`, then
    `settleGraceSeconds` to settle, then `SIGTERM`, then `SIGKILL`. The run is
    reported as `timeout` with the reason and last activity.
@@ -207,7 +229,7 @@ shows what would go.
 ```bash
 npm install                    # TypeScript and @types/node; host packages are peers
 ./setup-node-modules.sh        # link the host Pi packages for the tests
-npm run check                  # typecheck + 54 tests, no model calls, no API keys
+npm run check                  # typecheck + 57 tests, no model calls, no API keys
 ```
 
 The tests use a scripted fake RPC child (`test/fake-pi.mjs`), not a model, so

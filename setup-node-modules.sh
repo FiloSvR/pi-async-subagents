@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Link the host's Pi packages into ./node_modules for standalone tests.
 #
-# The extension runs *inside* Pi, where `@earendil-works/pi-coding-agent` and
-# `typebox` resolve natively. Node's test runner has no such resolution, so the
+# The extension runs *inside* Pi, where `@earendil-works/pi-coding-agent`,
+# `@earendil-works/pi-tui`, and `typebox` resolve natively. Node's test runner has no such resolution, so the
 # tests need these links. They are test-only; never install this directory as a
 # package (the host suppresses peer installs and maps these modules itself).
 set -euo pipefail
@@ -25,6 +25,9 @@ fi
 
 mkdir -p node_modules/@earendil-works node_modules/@types
 ln -sfn "$HOST/@earendil-works/pi-coding-agent" node_modules/@earendil-works/pi-coding-agent
+if [ -d "$HOST/@earendil-works/pi-tui" ]; then
+	ln -sfn "$HOST/@earendil-works/pi-tui" node_modules/@earendil-works/pi-tui
+fi
 ln -sfn "$HOST/typebox" node_modules/typebox
 [ -d "$HOST/@types/node" ] && ln -sfn "$HOST/@types/node" node_modules/@types/node
 echo "linked $HOST into ./node_modules"

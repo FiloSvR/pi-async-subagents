@@ -16,6 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.ts";
 import { SubagentRegistry, type RunRecord } from "./registry.ts";
@@ -29,9 +30,16 @@ import {
 	type CleanupResult,
 	type WorktreeSpec,
 } from "./worktree.ts";
-import { formatDuration, type RunStatus, SubagentRun, usageLine } from "./run.ts";
+import { formatDuration, formatTokens, type RunSnapshot, type RunStatus, SubagentRun, usageLine } from "./run.ts";
 
 const RESULT_MESSAGE_TYPE = "subagent_result";
+
+/** `subagent_result` details are a run snapshot plus worktree bookkeeping. */
+type SubagentResultDetails = Partial<RunSnapshot> & {
+	worktree?: string;
+	worktreeBranch?: string;
+	worktreeRemoved?: boolean;
+};
 const WIDGET_KEY = "subagents";
 const STATUS_KEY = "subagents";
 const UI_THROTTLE_MS = 250;
@@ -42,7 +50,11 @@ interface SubagentConfig {
 	maxRunMinutes: number;
 	/** How long an aborted child gets to report its own settlement before it is killed. */
 	settleGraceSeconds: number;
+	/** How long a finished run stays visible in the widget. */
+	finishedVisibleSeconds: number;
 	uiPolicy: "deny" | "allow";
+	/** How completed results appear in the transcript. */
+	resultDisplay: "summary" | "full" | "hidden";
 	maxDepth: number;
 	maxConcurrent: number;
 }
@@ -52,7 +64,9 @@ const DEFAULT_CONFIG: SubagentConfig = {
 	abortAfterSeconds: 600,
 	maxRunMinutes: 60,
 	settleGraceSeconds: 15,
+	finishedVisibleSeconds: 30,
 	uiPolicy: "deny",
+	resultDisplay: "summary",
 	maxDepth: 1,
 	maxConcurrent: 6,
 };
@@ -68,7 +82,10 @@ function loadConfig(): SubagentConfig {
 			abortAfterSeconds: positive(raw.abortAfterSeconds, DEFAULT_CONFIG.abortAfterSeconds),
 			maxRunMinutes: positive(raw.maxRunMinutes, DEFAULT_CONFIG.maxRunMinutes),
 			settleGraceSeconds: positive(raw.settleGraceSeconds, DEFAULT_CONFIG.settleGraceSeconds),
+			finishedVisibleSeconds: positive(raw.finishedVisibleSeconds, DEFAULT_CONFIG.finishedVisibleSeconds),
 			uiPolicy: raw.uiPolicy === "allow" ? "allow" : "deny",
+			resultDisplay:
+				raw.resultDisplay === "full" || raw.resultDisplay === "hidden" ? raw.resultDisplay : "summary",
 			maxDepth: positive(raw.maxDepth, DEFAULT_CONFIG.maxDepth),
 			maxConcurrent: positive(raw.maxConcurrent, DEFAULT_CONFIG.maxConcurrent),
 		};
@@ -195,11 +212,12 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 	const canSpawn = depth < config.maxDepth;
 	const sessionsDir = path.join(getAgentDir(), "subagents");
 	const runs = new Map<string, SubagentRun>();
-	const completed: SubagentRun[] = [];
+	const recentlyFinished: Array<{ run: SubagentRun; until: number }> = [];
 	let ctxRef: ExtensionContext | undefined;
 	let registry: SubagentRegistry = new SubagentRegistry(null);
 	let registrySessionId: string | undefined;
 	let uiTimer: ReturnType<typeof setTimeout> | null = null;
+	let expiryTimer: ReturnType<typeof setTimeout> | null = null;
 	let shuttingDown = false;
 
 	function rememberCtx(ctx: ExtensionContext): void {
@@ -236,38 +254,80 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 		if (typeof uiTimer === "object" && "unref" in uiTimer) uiTimer.unref();
 	}
 
+	function pruneFinished(now = Date.now()): Array<{ run: SubagentRun; until: number }> {
+		for (let index = recentlyFinished.length - 1; index >= 0; index -= 1) {
+			if (recentlyFinished[index]!.until <= now) recentlyFinished.splice(index, 1);
+		}
+		return recentlyFinished;
+	}
+
+	/** Clear the widget when the last recently-finished run expires. */
+	function scheduleExpiry(): void {
+		if (expiryTimer) {
+			clearTimeout(expiryTimer);
+			expiryTimer = null;
+		}
+		const recent = pruneFinished();
+		if (recent.length === 0) return;
+		const next = Math.min(...recent.map((entry) => entry.until));
+		expiryTimer = setTimeout(() => {
+			expiryTimer = null;
+			renderUi();
+			scheduleExpiry();
+		}, Math.max(0, next - Date.now()) + 50);
+		if (typeof expiryTimer === "object" && "unref" in expiryTimer) expiryTimer.unref();
+	}
+
+	function forgetFinished(name: string): void {
+		for (let index = recentlyFinished.length - 1; index >= 0; index -= 1) {
+			if (recentlyFinished[index]!.run.name === name) recentlyFinished.splice(index, 1);
+		}
+	}
+
+	function runInfo(run: SubagentRun): string {
+		return `${run.model ?? "default model"} · ctx ${formatTokens(run.usage.contextTokens)}`;
+	}
+
 	function renderUi(): void {
 		const ctx = ctxRef;
 		if (!ctx) return;
 		try {
 			const active = activeRuns();
-			const finished = completed.slice(-3).reverse();
+			const finished = pruneFinished().slice().reverse();
 			if (active.length === 0 && finished.length === 0) {
 				ctx.ui.setWidget(WIDGET_KEY, undefined);
 				ctx.ui.setStatus(STATUS_KEY, undefined);
 				return;
 			}
 
-			const lines: string[] = [];
-			const header = active.length === 0 ? "Subagents" : `Subagents · ${active.length} running`;
-			lines.push(header);
-			for (const run of [...active, ...finished].slice(0, 8)) {
+			const header = [
+				active.length > 0 ? `${active.length} running` : "",
+				finished.length > 0 ? `${finished.length} finished` : "",
+			].filter(Boolean);
+			const lines: string[] = [`Subagents · ${header.join(", ")}`];
+			const entries: SubagentRun[] = [...active, ...finished.map((entry) => entry.run)].slice(0, 8);
+			for (const run of entries) {
 				const elapsed = formatDuration((run.endedAt ?? Date.now()) - run.startedAt);
-				const status = run.isTerminal ? run.status : run.status === "stalled" ? "stalled" : run.activity;
-				const stall =
-					run.isTerminal || run.status === "stalled"
+				const status =
+					run.isTerminal
+						? run.status
+						: run.status === "stalled"
+							? "stalled"
+							: run.status === "starting"
+								? "starting"
+								: run.activity;
+				// "idle" only makes sense once the child accepted the task; startup is not idle.
+				const idle =
+					run.isTerminal || run.status !== "running"
 						? ""
 						: ` (idle ${formatDuration(Date.now() - run.lastActivityAt)})`;
-				lines.push(`  ${elapsed.padStart(5)}  ${run.name}  ${status}${stall}`);
+				lines.push(`  ${elapsed.padStart(5)}  ${run.name}  ${status} · ${runInfo(run)}${idle}`);
 			}
-			const hidden = active.length + finished.length - Math.min(8, active.length + finished.length);
+			const hidden = active.length + finished.length - entries.length;
 			if (hidden > 0) lines.push(`  +${hidden} more`);
 
 			ctx.ui.setWidget(WIDGET_KEY, lines);
-			ctx.ui.setStatus(
-				STATUS_KEY,
-				active.length === 0 ? undefined : `${active.length} subagent${active.length === 1 ? "" : "s"}`,
-			);
+			ctx.ui.setStatus(STATUS_KEY, active.length === 0 ? undefined : `${active.length} subagent${active.length === 1 ? "" : "s"}`);
 		} catch {
 			// Rendering is best effort: never let UI trouble touch a run.
 		}
@@ -282,7 +342,8 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 		const snapshot = run.snapshot();
 		const elapsed = formatDuration((snapshot.endedAt ?? Date.now()) - snapshot.startedAt);
 		const usage = usageLine(snapshot.usage);
-		const head = `**${snapshot.name}** (${snapshot.agent}) ${statusVerb(snapshot.status)} after ${elapsed}${usage ? ` · ${usage}` : ""}`;
+		const model = snapshot.model ? ` · ${snapshot.model}` : "";
+		const head = `**${snapshot.name}** (${snapshot.agent}) ${statusVerb(snapshot.status)} after ${elapsed}${model}${usage ? ` · ${usage}` : ""}`;
 		const lines: string[] = [head];
 
 		if (snapshot.error) lines.push(`Reason: ${snapshot.error}`);
@@ -349,8 +410,6 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 
 	function settleRun(run: SubagentRun, record: RunRecord): void {
 		runs.delete(run.name);
-		completed.push(run);
-		if (completed.length > 20) completed.splice(0, completed.length - 20);
 		const snapshot = run.snapshot();
 
 		if (record.worktreePath && record.worktreeBranch && record.worktreeBase && snapshot.status === "finished") {
@@ -372,6 +431,10 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 			}
 		}
 
+		forgetFinished(run.name);
+		recentlyFinished.push({ run, until: Date.now() + config.finishedVisibleSeconds * 1_000 });
+		if (recentlyFinished.length > 20) recentlyFinished.splice(0, recentlyFinished.length - 20);
+		scheduleExpiry();
 		registry.update(run.name, {
 			status: snapshot.status,
 			sessionId: snapshot.sessionId ?? record.sessionId,
@@ -392,7 +455,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 				{
 					customType: RESULT_MESSAGE_TYPE,
 					content: [{ type: "text" as const, text: runSummary(run, record) }],
-					display: true,
+					display: config.resultDisplay !== "hidden",
 					details: { ...snapshot, agent: record.agent, worktree: record.worktreePath, worktreeBranch: record.worktreeBranch, worktreeRemoved: record.worktreeRemoved },
 				},
 				{ triggerTurn: true, deliverAs: "followUp" },
@@ -478,6 +541,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 			},
 		});
 		runs.set(name, run);
+		forgetFinished(name);
 		scheduleUi();
 		return run;
 	}
@@ -504,6 +568,36 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 		const active = activeRuns();
 		await Promise.all(active.map((run) => run.cancel(reason, true).catch(() => undefined)));
 	}
+
+	// ---------------------------------------------------------------------
+	// Rendering
+	// ---------------------------------------------------------------------
+
+	/** Collapse a delivered result to one line; Ctrl+O expands the full message. */
+	pi.registerMessageRenderer(RESULT_MESSAGE_TYPE, (message, { expanded, outputPad }, theme) => {
+		if (config.resultDisplay === "full" || expanded) return undefined;
+		const details = (message.details ?? {}) as SubagentResultDetails;
+		const name = details.name ?? "subagent";
+		const status = details.status ?? "finished";
+		const color = status === "finished" ? "success" : status === "cancelled" ? "warning" : "error";
+		const bits: string[] = [statusVerb(status)];
+		if (details.startedAt !== undefined) {
+			bits.push(`in ${formatDuration((details.endedAt ?? Date.now()) - details.startedAt)}`);
+		}
+		if (details.model) bits.push(details.model);
+		if (details.usage) {
+			const usage = usageLine(details.usage);
+			if (usage) bits.push(usage);
+		}
+		if (details.worktree) {
+			bits.push(`worktree ${details.worktreeRemoved ? "removed" : details.worktree}`);
+		}
+		const headline = `${theme.fg(color, theme.bold(`[subagent] ${name}`))} ${theme.fg("dim", bits.join(" · "))}`;
+		const reason = details.error ? `\n${theme.fg("error", `Reason: ${details.error}`)}` : "";
+		const box = new Box(outputPad, 0, (text) => theme.bg("customMessageBg", text));
+		box.addChild(new Text(`${headline}${reason} ${theme.fg("dim", "(Ctrl+O to expand)")}`, 0, 0));
+		return box;
+	});
 
 	// ---------------------------------------------------------------------
 	// Tools
@@ -842,7 +936,9 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 				for (const run of active) {
 					const elapsed = formatDuration(Date.now() - run.startedAt);
 					const idle = formatDuration(Date.now() - run.lastActivityAt);
-					lines.push(`  ${run.name} (${run.agent}) ${run.status} · ${run.activity} · ${elapsed} · idle ${idle}`);
+					lines.push(
+						`  ${run.name} (${run.agent}) ${run.status} · ${run.activity} · ${runInfo(run)} · ${elapsed} · idle ${idle}`,
+					);
 				}
 			}
 

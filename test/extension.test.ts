@@ -17,7 +17,13 @@ fs.writeFileSync(
 fs.mkdirSync(path.join(AGENT_DIR, "subagents"), { recursive: true });
 fs.writeFileSync(
 	path.join(AGENT_DIR, "subagents", "config.json"),
-	JSON.stringify({ settleGraceSeconds: 0.4, stallSeconds: 1, abortAfterSeconds: 2, maxRunMinutes: 1 }),
+	JSON.stringify({
+		settleGraceSeconds: 0.4,
+		finishedVisibleSeconds: 1,
+		stallSeconds: 1,
+		abortAfterSeconds: 2,
+		maxRunMinutes: 1,
+	}),
 );
 
 // The extension spawns process.argv[1]; point it at the scripted fake.
@@ -44,6 +50,10 @@ function makeHarness(cwd = process.cwd()) {
 	const sent: SentMessage[] = [];
 	const notifications: Array<{ message: string; type?: string }> = [];
 	const widgetCalls: Array<{ key: string; content: unknown }> = [];
+	const messageRenderers = new Map<
+		string,
+		(message: { content: Array<{ type: string; text: string }>; details?: unknown }, options: { expanded: boolean; outputPad: number }, theme: unknown) => unknown
+	>();
 
 	const ui = {
 		confirm: async () => true,
@@ -86,9 +96,12 @@ function makeHarness(cwd = process.cwd()) {
 		},
 		registerShortcut: () => undefined,
 		registerToolRenderer: () => undefined,
+		registerMessageRenderer: (customType: string, renderer: (typeof messageRenderers) extends Map<string, infer R> ? R : never) => {
+			messageRenderers.set(customType, renderer);
+		},
 	};
 
-	return { api, ctx, tools, commands, events, sent, notifications, widgetCalls };
+	return { api, ctx, tools, commands, events, sent, notifications, widgetCalls, messageRenderers };
 }
 
 async function fire(events: Map<string, Array<(e: unknown, c: unknown) => unknown>>, name: string, ctx: unknown) {
@@ -264,6 +277,85 @@ test("worktree: true and cwd are mutually exclusive", async () => {
 		ctx,
 	);
 	assert.match(result.content[0]?.text ?? "", /mutually exclusive/);
+});
+
+test("a delivered result collapses to one line and expands on demand", () => {
+	const { api, messageRenderers } = makeHarness();
+	subagentsExtension(api as never);
+	const renderer = messageRenderers.get("subagent_result");
+	assert.ok(renderer, "the result message needs a renderer");
+
+	const message = {
+		content: [{ type: "text", text: "**w1** (worker) finished after 2s\n\nAll done.\n\nResume or steer..." }],
+		details: {
+			name: "w1",
+			agent: "worker",
+			status: "finished",
+			startedAt: Date.now() - 2_000,
+			endedAt: Date.now(),
+			usage: { input: 1_000, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0.0042, contextTokens: 0, turns: 1 },
+		},
+	};
+	const theme = {
+		fg: (_color: string, text: string) => text,
+		bg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+	const collapsed = renderer!(message, { expanded: false, outputPad: 1 }, theme) as { render: (width: number) => string[] };
+	const lines = collapsed.render(120).join("\n");
+	assert.match(lines, /\[subagent\] w1/);
+	assert.match(lines, /finished/);
+	assert.match(lines, /Ctrl\+O to expand/);
+	assert.doesNotMatch(lines, /All done/);
+	assert.equal(renderer!(message, { expanded: true, outputPad: 1 }, theme), undefined);
+});
+
+function widgetLines(widgetCalls: Array<{ key: string; content: unknown }>, name: string): string[] {
+	return widgetCalls
+		.filter((call) => call.key === "subagents" && Array.isArray(call.content))
+		.flatMap((call) => (call.content as unknown[]).map(String))
+		.filter((line) => line.includes(name));
+}
+
+test("a running subagent appears in the widget, shows briefly when finished, then clears", async () => {
+	const { api, ctx, tools, events, sent, widgetCalls } = makeHarness();
+	subagentsExtension(api as never);
+	await fire(events, "session_start", ctx);
+
+	// "stall" keeps the run alive long enough for the throttled widget to render it.
+	process.env.FAKE_PI_SCENARIO = "stall";
+	await tools.get("subagent")!.execute("c1", { agent: "worker", task: "wait", name: "w4" }, undefined, undefined, ctx);
+	await waitFor(() => widgetLines(widgetCalls, "w4").length > 0);
+
+	await tools.get("subagent_cancel")!.execute("c2", { name: "w4" }, undefined, undefined, ctx);
+	await waitFor(() => sent.some((message) => message.customType === "subagent_result"));
+	assert.ok(
+		widgetLines(widgetCalls, "w4").some((line) => line.includes("cancelled")),
+		"a finished run should stay in the widget for its visible window",
+	);
+	await waitFor(() => {
+		const widget = [...widgetCalls].reverse().find((call) => call.key === "subagents");
+		return widget?.content === undefined;
+	});
+	process.env.FAKE_PI_SCENARIO = "ok";
+});
+
+test("a finished widget entry shows context token usage", async () => {
+	const { api, ctx, tools, events, sent, widgetCalls } = makeHarness();
+	subagentsExtension(api as never);
+	await fire(events, "session_start", ctx);
+
+	process.env.FAKE_PI_SCENARIO = "ok";
+	await tools.get("subagent")!.execute("c1", { agent: "worker", task: "done", name: "w5" }, undefined, undefined, ctx);
+	await waitFor(() => sent.some((message) => message.customType === "subagent_result"));
+	assert.ok(
+		widgetLines(widgetCalls, "w5").some((line) => line.includes("ctx 1.1k")),
+		"the widget entry should show the child's context token count",
+	);
+	assert.ok(
+		widgetLines(widgetCalls, "w5").some((line) => line.includes("test/test-model")),
+		"the widget entry should show the child's model",
+	);
 });
 
 test("a nested subagent context gets no spawn tools or command", () => {

@@ -77,8 +77,9 @@ export class ChildRpc {
 	/**
 	 * Start the child and prove it speaks RPC by asking for its state. Throws if
 	 * the process is missing its CLI, crashes on startup, or never answers.
+	 * Returns the state so callers need no second `get_state` round trip.
 	 */
-	async start(timeoutMs = 20_000): Promise<void> {
+	async start(timeoutMs = 20_000): Promise<unknown> {
 		if (this.child) throw new Error("child already started");
 
 		const child = spawn(this.spec.command, this.spec.args, {
@@ -109,7 +110,7 @@ export class ChildRpc {
 			this.failAll(new Error(`subagent stdin error: ${error.message}`));
 		});
 
-		await this.send({ type: "get_state" }, timeoutMs);
+		return await this.send({ type: "get_state" }, timeoutMs);
 	}
 
 	onEvent(handler: RpcEventHandler): () => void {

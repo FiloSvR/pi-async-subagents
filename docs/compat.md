@@ -1,8 +1,9 @@
 # pi compatibility
 
 Tested with `@earendil-works/pi-coding-agent` 1.4.0 on Node 24. The extension
-is a Pi package: the host supplies `@earendil-works/pi-coding-agent` and
-`typebox` (peer, `*`); never add them to `dependencies`.
+is a Pi package: the host supplies `@earendil-works/pi-coding-agent`,
+`@earendil-works/pi-tui`, and `typebox` (peer, `*`); never add them to
+`dependencies`.
 
 ## Surfaces used
 
@@ -10,9 +11,15 @@ is a Pi package: the host supplies `@earendil-works/pi-coding-agent` and
 
 - `ExtensionAPI` / `ExtensionContext`
 - `getAgentDir()`
-- `registerTool`, `registerCommand`, `on` (session start/reload, tool calls)
+- `registerTool`, `registerCommand`, `registerMessageRenderer`, `on`
+  (session start/reload, tool calls)
 - the tool result and UI-policy shape
 - `typebox` `Type` schemas
+
+### Host TUI API
+
+- `Box`, `Text` from `@earendil-works/pi-tui` (compact result rendering)
+- the custom message renderer contract (`expanded`, `outputPad`, theme)
 
 ### Child process (RPC)
 
