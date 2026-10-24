@@ -43,6 +43,8 @@ type SubagentResultDetails = Partial<RunSnapshot> & {
 const WIDGET_KEY = "subagents";
 const STATUS_KEY = "subagents";
 const UI_THROTTLE_MS = 250;
+/** Keep elapsed and idle times moving even while a child is silent. */
+const UI_REFRESH_MS = 2_000;
 
 interface SubagentConfig {
 	stallSeconds: number;
@@ -218,6 +220,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 	let registrySessionId: string | undefined;
 	let uiTimer: ReturnType<typeof setTimeout> | null = null;
 	let expiryTimer: ReturnType<typeof setTimeout> | null = null;
+	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 	let shuttingDown = false;
 
 	function rememberCtx(ctx: ExtensionContext): void {
@@ -246,12 +249,32 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 	}
 
 	function scheduleUi(): void {
+		ensureRefresh();
 		if (uiTimer) return;
 		uiTimer = setTimeout(() => {
 			uiTimer = null;
 			renderUi();
 		}, UI_THROTTLE_MS);
 		if (typeof uiTimer === "object" && "unref" in uiTimer) uiTimer.unref();
+	}
+
+	/** Re-render on a slow clock so elapsed/idle times tick without child events. */
+	function ensureRefresh(): void {
+		if (refreshTimer) return;
+		refreshTimer = setInterval(() => {
+			if (runs.size === 0 && pruneFinished().length === 0) {
+				stopRefresh();
+				renderUi();
+				return;
+			}
+			renderUi();
+		}, UI_REFRESH_MS);
+		if (typeof refreshTimer === "object" && "unref" in refreshTimer) refreshTimer.unref();
+	}
+
+	function stopRefresh(): void {
+		if (refreshTimer) clearInterval(refreshTimer);
+		refreshTimer = null;
 	}
 
 	function pruneFinished(now = Date.now()): Array<{ run: SubagentRun; until: number }> {

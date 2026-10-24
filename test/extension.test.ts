@@ -21,7 +21,7 @@ fs.writeFileSync(
 		settleGraceSeconds: 0.4,
 		finishedVisibleSeconds: 1,
 		stallSeconds: 1,
-		abortAfterSeconds: 2,
+		abortAfterSeconds: 30,
 		maxRunMinutes: 1,
 	}),
 );
@@ -308,6 +308,26 @@ test("a delivered result collapses to one line and expands on demand", () => {
 	assert.match(lines, /Ctrl\+O to expand/);
 	assert.doesNotMatch(lines, /All done/);
 	assert.equal(renderer!(message, { expanded: true, outputPad: 1 }, theme), undefined);
+});
+
+test("a silent subagent's widget keeps refreshing", async () => {
+	const { api, ctx, tools, events, sent, widgetCalls } = makeHarness();
+	subagentsExtension(api as never);
+	await fire(events, "session_start", ctx);
+
+	// The child goes silent: any later widget update must come from the refresh clock.
+	process.env.FAKE_PI_SCENARIO = "stall";
+	await tools.get("subagent")!.execute("c1", { agent: "worker", task: "wait", name: "w6" }, undefined, undefined, ctx);
+	await waitFor(() => widgetLines(widgetCalls, "w6").some((line) => line.includes("stalled")), 4_000);
+
+	// Let any throttled event-driven render land, then watch the clock alone.
+	await new Promise((resolve) => setTimeout(resolve, 500));
+	const before = widgetCalls.length;
+	await waitFor(() => widgetCalls.length > before, 3_000);
+
+	await tools.get("subagent_cancel")!.execute("c2", { name: "w6" }, undefined, undefined, ctx);
+	await waitFor(() => sent.some((message) => message.customType === "subagent_result" && /w6/.test(message.content[0]?.text ?? "")));
+	process.env.FAKE_PI_SCENARIO = "ok";
 });
 
 function widgetLines(widgetCalls: Array<{ key: string; content: unknown }>, name: string): string[] {

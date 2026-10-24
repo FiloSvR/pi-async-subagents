@@ -55,6 +55,8 @@ The widget above the editor lists running subagents, plus finished ones for
 After that window the finished entries disappear; when nothing is running or
 recently finished, the widget and its status clear. Every row also shows the
 child's model and current context size, e.g. `openrouter/z-ai/glm-5.3-flash · ctx 12.3k`.
+The widget re-renders every 2 seconds, so elapsed and idle times keep moving
+even while a child is silent between events.
 
 Each delivered result is a custom message that stays in the transcript, but it
 is collapsed to one status line (`[subagent] name · finished · duration · usage`).
