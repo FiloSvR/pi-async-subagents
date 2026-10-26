@@ -1,6 +1,6 @@
 {
 	"name": "pi-async-subagents",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"private": true,
 	"description": "Async, liveness-checked subagents for pi: background runs, worktrees, cleanup",
 	"type": "module",

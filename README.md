@@ -15,7 +15,7 @@ This is a Pi package. Install it from this repository's git URL, pinned to a
 tag:
 
 ```bash
-pi install git:<this-repository>@v0.1.0
+pi install git:<this-repository>@v0.1.1
 pi list
 ```
 
@@ -234,13 +234,106 @@ npm install                    # TypeScript and @types/node; host packages are p
 npm run check                  # typecheck + 63 tests, no model calls, no API keys
 ```
 
-The tests use a scripted fake RPC child (`test/fake-pi.mjs`), not a model, so
-they run offline and free. `test/rpc.test.ts` covers the protocol, `run.test.ts`
-covers timeouts/stalls/kill, `registry.test.ts` covers names and persistence,
-`agents.test.ts` covers discovery, `worktree.test.ts` covers git worktrees, and
-`extension.test.ts` covers the tool wiring end to end.
+## Tests
 
-A zero-token smoke test against the real CLI:
+`npm run check` typechecks the extension and runs every `test/*.test.ts` with
+Node's built-in runner. No test calls a model or needs an API key: where a real
+child would be `pi --mode rpc`, the tests spawn `test/fake-pi.mjs`, a scripted
+stand-in that speaks the same JSONL protocol. Its scenario (an argument, or
+`FAKE_PI_SCENARIO`) decides how it behaves:
+
+| Scenario | Behaviour |
+| --- | --- |
+| `ok` | One assistant turn with a tool call, then `agent_settled`. |
+| `crash` | Exits with code 3 as soon as the prompt arrives. |
+| `stall` | Starts a message, then goes silent and ignores `abort`. |
+| `ui` | Opens a confirm dialog and reports how it was answered. |
+| `handled` | Reports the prompt as handled; no model run follows. |
+| `noisy` | Writes non-JSON to stdout and stderr, then behaves like `ok`. |
+
+Set `FAKE_PI_LOG` to a file to record the commands and dialog answers the fake
+received; several tests assert on that log.
+
+### `rpc.test.ts`: the RPC client
+
+- `start()` proves the child speaks RPC by getting its state.
+- A command the child rejects fails with the child's error message.
+- `stop()` kills the child; commands sent after exit reject instead of hanging.
+- Events reach subscribers, and non-JSON stdout is kept as diagnostics, not fatal.
+- `respondToUI` answers a dialog and the child carries on.
+- A command with no response rejects at its deadline.
+- A child that dies mid-command rejects that command.
+
+### `run.test.ts`: one run's lifecycle and liveness
+
+- `start()` returns while the child is still working.
+- A completed run reports its text, usage and turns, and its process is gone.
+- A child that exits without settling fails the run instead of hanging it.
+- Silence marks a run `stalled`, and it can still be cancelled.
+- A run that never settles is aborted, then killed, and reported as `timeout`.
+- The runtime cap stops a run even when it keeps producing events.
+- With `uiPolicy: deny`, dialogs are declined and recorded, and the run is not blocked.
+- With `uiPolicy: allow`, dialogs are answered so the child proceeds.
+- `steer()` returns the child's disposition; `cancel()` on a finished run is a no-op.
+
+### `registry.test.ts`: names and persistence
+
+- Names are sanitised into usable handles, and duplicates get `-2`, `-3`, ….
+- No registry file is used without a parent session id.
+- Records survive a reload, and a corrupt file loads as empty instead of throwing.
+- `update()` patches a record and ignores unknown names.
+
+### `agents.test.ts`: agent discovery
+
+- Frontmatter and body are parsed, including comma-separated `tools`.
+- `system-prompt: replace` / `prepend` and `worktree: true` are recognised.
+- Files without `name` or `description` are skipped.
+- Project agents come from the nearest ancestor `.pi/agents`.
+- `agentScope` controls which directories are read, and a project agent
+  overrides a user agent with the same name.
+- `formatAgentList` summarises agents for the model.
+
+### `worktree.test.ts`: git worktrees (real temporary repositories)
+
+- A worktree is created on a new branch from the base, and kept out of `git status`.
+- An existing branch is reused without being claimed as created.
+- An untouched worktree counts as unchanged; edits or commits do not.
+- Removing a worktree deletes its branch.
+- Two worktrees in parallel do not interfere.
+- Outside a repository, or with a missing base, creation fails with a clear error.
+- Cleanup removes only merged, clean worktrees under `.pi/worktrees`; `dryRun`
+  removes nothing; a worktree an active run uses is kept; the main checkout is
+  never touched.
+
+### `extension.test.ts`: the extension end to end
+
+These load `index.ts` against a fake `ExtensionAPI`, with `PI_CODING_AGENT_DIR`
+pointed at a temporary directory so the real `~/.pi` is never read.
+
+- All five tools and `/subagents` are registered; a child at max depth gets none.
+- `subagent` returns before the child finishes, and the result arrives later as a
+  follow-up message that triggers a turn.
+- `subagent_message` steers a running subagent and resumes a finished one.
+- `subagents_list`, `subagent_cancel`, and `/subagents` with nothing running
+  report what they should; an unknown agent is answered with the available list.
+- `worktree: true` runs in its own checkout and removes it when unchanged;
+  `worktree` with `cwd` is refused.
+- A delivered result collapses to one line and expands on demand.
+- The widget shows a running subagent, keeps refreshing while it is silent,
+  shows a finished one briefly with its model and context size, then clears.
+- `/subagents cleanup` keeps the worktree of a running subagent.
+- Resuming a worktree run keeps its worktree record, so an unchanged resume
+  still removes it.
+- A resume respects `maxConcurrent` and will not switch to a same-named agent
+  from another source.
+- A vetoed session switch leaves runs alone; shutdown stops them without
+  triggering a turn in the closing session.
+
+### Smoke test
+
+The fake cannot catch drift in the real CLI's framing, lifecycle or spawn
+arguments. `npm run smoke` starts the real `pi --mode rpc`, asks for its state,
+and stops it, using zero tokens:
 
 ```bash
 npm run smoke                  # PI_CLI=/path/to/pi to pick the binary
