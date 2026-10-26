@@ -14,6 +14,8 @@ import type { RunStatus } from "./run.ts";
 export interface RunRecord {
 	name: string;
 	agent: string;
+	/** Where the agent definition came from, so a resume cannot switch to a same-named one. */
+	agentSource?: "user" | "project";
 	task: string;
 	cwd: string;
 	model?: string;

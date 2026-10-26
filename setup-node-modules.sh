@@ -8,13 +8,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# An explicit path wins (CI and the canary pass the version under test);
+# otherwise fall back to the managed install's current release.
+HOST="${1:-}"
 ROOT="${PI_MANAGED_INSTALL_ROOT:-${PI_AGENT_DIR:-$HOME/.pi/agent}/install}"
 VERSION_FILE="$ROOT/current-version"
-if [ -r "$VERSION_FILE" ]; then
+if [ -z "$HOST" ] && [ -r "$VERSION_FILE" ]; then
 	VERSION="$(cat "$VERSION_FILE")"
 	HOST="$ROOT/releases/$VERSION/node_modules"
-else
-	HOST="${1:-}"
 fi
 
 if [ -z "${HOST:-}" ] || [ ! -d "$HOST/@earendil-works/pi-coding-agent" ]; then

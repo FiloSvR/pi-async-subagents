@@ -391,3 +391,133 @@ test("a nested subagent context gets no spawn tools or command", () => {
 		else process.env.PI_SUBAGENT_DEPTH = previous;
 	}
 });
+
+function makeRepo(t: { after(fn: () => unknown): void }): string {
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-ext-git-"));
+	t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
+	const git = (args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore" });
+	git(["init", "-b", "main"]);
+	git(["config", "user.email", "test@example.com"]);
+	git(["config", "user.name", "Test"]);
+	git(["commit", "--allow-empty", "-m", "init"]);
+	return repo;
+}
+
+function resultFor(sent: SentMessage[], name: string): SentMessage[] {
+	return sent.filter((message) => message.customType === "subagent_result" && message.content[0]?.text.includes(`**${name}**`));
+}
+
+test("/subagents cleanup keeps the worktree of a running subagent", async (t) => {
+	const repo = makeRepo(t);
+	const { api, ctx, tools, commands, events, sent, notifications } = makeHarness(repo);
+	subagentsExtension(api as never);
+	await fire(events, "session_start", ctx);
+
+	// A fresh worktree branch has no commits, so it counts as merged: only the active check protects it.
+	process.env.FAKE_PI_SCENARIO = "stall";
+	await tools.get("subagent")!.execute("c1", { agent: "worker", task: "wait", name: "busy", worktree: true, branch: "busy-1" }, undefined, undefined, ctx);
+	const worktreePath = path.join(fs.realpathSync(repo), ".pi", "worktrees", "busy-1");
+
+	await commands.get("subagents")!.handler("cleanup", ctx);
+	assert.equal(fs.existsSync(worktreePath), true, "cleanup removed a checkout a run is using");
+	assert.ok(notifications.some((n) => /still running/.test(n.message)));
+
+	await tools.get("subagent_cancel")!.execute("c2", { name: "busy" }, undefined, undefined, ctx);
+	await waitFor(() => resultFor(sent, "busy").length > 0);
+	process.env.FAKE_PI_SCENARIO = "ok";
+});
+
+test("resuming a worktree run keeps its worktree", async (t) => {
+	const repo = makeRepo(t);
+	const { api, ctx, tools, events, sent } = makeHarness(repo);
+	subagentsExtension(api as never);
+	await fire(events, "session_start", ctx);
+
+	// A cancelled run keeps its worktree; the resumed run then finishes unchanged and removes it.
+	process.env.FAKE_PI_SCENARIO = "stall";
+	await tools.get("subagent")!.execute("c1", { agent: "worker", task: "wait", name: "wtr", worktree: true, branch: "resume-1" }, undefined, undefined, ctx);
+	await tools.get("subagent_cancel")!.execute("c2", { name: "wtr" }, undefined, undefined, ctx);
+	await waitFor(() => resultFor(sent, "wtr").length === 1);
+	const worktreePath = path.join(fs.realpathSync(repo), ".pi", "worktrees", "resume-1");
+	assert.equal(fs.existsSync(worktreePath), true);
+
+	process.env.FAKE_PI_SCENARIO = "ok";
+	const resumed = await tools.get("subagent_message")!.execute("c3", { name: "wtr", message: "continue" }, undefined, undefined, ctx);
+	assert.match(resumed.content[0]?.text ?? "", /Resumed "wtr"/);
+	await waitFor(() => resultFor(sent, "wtr").length === 2);
+	assert.match(resultFor(sent, "wtr")[1]?.content[0]?.text ?? "", /Worktree: removed after the run/);
+	assert.equal(fs.existsSync(worktreePath), false);
+});
+
+test("resume respects maxConcurrent", async (t) => {
+	const configFile = path.join(AGENT_DIR, "subagents", "config.json");
+	const original = fs.readFileSync(configFile, "utf-8");
+	t.after(() => fs.writeFileSync(configFile, original));
+
+	const first = makeHarness();
+	subagentsExtension(first.api as never);
+	await fire(first.events, "session_start", first.ctx);
+	process.env.FAKE_PI_SCENARIO = "ok";
+	await first.tools.get("subagent")!.execute("c1", { agent: "worker", task: "done", name: "cap-done" }, undefined, undefined, first.ctx);
+	await waitFor(() => resultFor(first.sent, "cap-done").length > 0);
+
+	// Same parent session id, so the new instance remembers cap-done.
+	fs.writeFileSync(configFile, JSON.stringify({ ...JSON.parse(original), maxConcurrent: 1 }));
+	const { api, ctx, tools, events, sent } = makeHarness();
+	subagentsExtension(api as never);
+	await fire(events, "session_start", ctx);
+
+	process.env.FAKE_PI_SCENARIO = "stall";
+	await tools.get("subagent")!.execute("c2", { agent: "worker", task: "wait", name: "cap-busy" }, undefined, undefined, ctx);
+	const resumed = await tools.get("subagent_message")!.execute("c3", { name: "cap-done", message: "again" }, undefined, undefined, ctx);
+	assert.match(resumed.content[0]?.text ?? "", /already running/);
+
+	await tools.get("subagent_cancel")!.execute("c4", { name: "cap-busy" }, undefined, undefined, ctx);
+	await waitFor(() => resultFor(sent, "cap-busy").length > 0);
+	process.env.FAKE_PI_SCENARIO = "ok";
+});
+
+test("resume does not switch to a same-named agent from the project", async (t) => {
+	const userFile = path.join(AGENT_DIR, "agents", "solo.md");
+	fs.writeFileSync(userFile, "---\nname: solo\ndescription: User solo agent\n---\nUser prompt.\n");
+	t.after(() => fs.rmSync(userFile, { force: true }));
+	const project = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-ext-project-"));
+	t.after(() => fs.rmSync(project, { recursive: true, force: true }));
+
+	const { api, ctx, tools, events, sent } = makeHarness(project);
+	subagentsExtension(api as never);
+	await fire(events, "session_start", ctx);
+
+	process.env.FAKE_PI_SCENARIO = "ok";
+	await tools.get("subagent")!.execute("c1", { agent: "solo", task: "done", name: "solo-1" }, undefined, undefined, ctx);
+	await waitFor(() => resultFor(sent, "solo-1").length > 0);
+
+	// The user definition goes away and a repository ships one with the same name.
+	fs.rmSync(userFile);
+	fs.mkdirSync(path.join(project, ".pi", "agents"), { recursive: true });
+	fs.writeFileSync(path.join(project, ".pi", "agents", "solo.md"), "---\nname: solo\ndescription: Project solo agent\n---\nRepo prompt.\n");
+
+	const resumed = await tools.get("subagent_message")!.execute("c2", { name: "solo-1", message: "again" }, undefined, undefined, ctx);
+	assert.match(resumed.content[0]?.text ?? "", /no longer available/);
+});
+
+test("a vetoed session switch keeps runs; shutdown stops them without a new turn", async () => {
+	const { api, ctx, tools, events, sent } = makeHarness();
+	subagentsExtension(api as never);
+	await fire(events, "session_start", ctx);
+
+	process.env.FAKE_PI_SCENARIO = "stall";
+	await tools.get("subagent")!.execute("c1", { agent: "worker", task: "wait", name: "sw" }, undefined, undefined, ctx);
+
+	// Another handler may still cancel the switch, so before_switch alone must not stop anything.
+	await fire(events, "session_before_switch", ctx);
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	const listed = await tools.get("subagents_list")!.execute("c2", { includeAgents: false }, undefined, undefined, ctx);
+	assert.match(listed.content[0]?.text ?? "", /sw \(worker\)/);
+
+	await fire(events, "session_shutdown", ctx);
+	const after = await tools.get("subagents_list")!.execute("c3", { includeAgents: false }, undefined, undefined, ctx);
+	assert.match(after.content[0]?.text ?? "", /Running: none/);
+	assert.equal(resultFor(sent, "sw").length, 0, "a shutting-down session must not get a result turn");
+	process.env.FAKE_PI_SCENARIO = "ok";
+});

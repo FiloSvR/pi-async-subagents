@@ -435,7 +435,14 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 		runs.delete(run.name);
 		const snapshot = run.snapshot();
 
-		if (record.worktreePath && record.worktreeBranch && record.worktreeBase && snapshot.status === "finished") {
+		if (
+			record.worktreePath &&
+			record.worktreeBranch &&
+			record.worktreeBase &&
+			!record.worktreeRemoved &&
+			fs.existsSync(record.worktreePath) &&
+			snapshot.status === "finished"
+		) {
 			const spec: WorktreeSpec = {
 				repoRoot: record.worktreeRepoRoot ?? path.dirname(path.dirname(path.dirname(record.worktreePath))),
 				path: record.worktreePath,
@@ -512,19 +519,28 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 		});
 		const rpc = new ChildRpc(spawned.spec);
 
+		// A resume continues the remembered record: its worktree and session stay attached.
+		const previous = options.resume ? registry.get(name) : undefined;
 		const record: RunRecord = {
+			...previous,
 			name,
 			agent: agent.name,
+			agentSource: agent.source,
 			task,
 			cwd,
 			model: options.model ?? agent.model,
 			sessionId: spawned.sessionId,
-			worktreePath: options.worktree?.path,
-			worktreeRepoRoot: options.worktree?.repoRoot,
-			worktreeBranch: options.worktree?.branch,
-			worktreeBase: options.worktree?.base,
-			worktreeCreatedBranch: options.worktree?.createdBranch,
-			createdAt: Date.now(),
+			...(options.worktree
+				? {
+						worktreePath: options.worktree.path,
+						worktreeRepoRoot: options.worktree.repoRoot,
+						worktreeBranch: options.worktree.branch,
+						worktreeBase: options.worktree.base,
+						worktreeCreatedBranch: options.worktree.createdBranch,
+						worktreeRemoved: false,
+					}
+				: {}),
+			createdAt: previous?.createdAt ?? Date.now(),
 			updatedAt: Date.now(),
 			status: "starting",
 		};
@@ -578,10 +594,10 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 		renderUi();
 	});
 
-	pi.on("session_before_switch", async () => {
-		await cancelAll("session switched");
-	});
-
+	// Switch, fork and reload all end in session_shutdown, which only fires once
+	// the change is committed (a session_before_switch handler may still veto it).
+	// Stopping runs here means a vetoed switch keeps them, and no result turn is
+	// triggered in a session that is going away.
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
 		await cancelAll("session shut down");
@@ -590,6 +606,25 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 	async function cancelAll(reason: string): Promise<void> {
 		const active = activeRuns();
 		await Promise.all(active.map((run) => run.cancel(reason, true).catch(() => undefined)));
+	}
+
+	/** Cleanup must never remove a checkout a live run is working in. */
+	function isWorktreeActive(worktreePath: string): boolean {
+		return activeRuns().some((run) => run.cwd === worktreePath);
+	}
+
+	/** Project agents come from the repository; ask before running one in an untrusted project. */
+	async function approveProjectAgent(agent: AgentConfig, ctx: ExtensionContext): Promise<boolean> {
+		if (agent.source !== "project" || !ctx.hasUI || ctx.isProjectTrusted()) return true;
+		return await ctx.ui.confirm(
+			"Run a project-local agent?",
+			`Agent: ${agent.name}\nSource: ${agent.filePath}\n\nProject agents come from the repository. Only continue for trusted code.`,
+		);
+	}
+
+	function tooManyRunning(): string | undefined {
+		if (activeRuns().length < config.maxConcurrent) return undefined;
+		return `${config.maxConcurrent} subagents are already running. Wait for one to finish, or raise maxConcurrent in ~/.pi/agent/subagents/config.json.`;
 	}
 
 	// ---------------------------------------------------------------------
@@ -626,6 +661,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 	// Tools
 	// ---------------------------------------------------------------------
 
+	// A child at max depth gets none of these: it cannot spawn, so it has nothing to list or manage.
 	if (canSpawn) {
 		pi.registerTool({
 			name: "subagent",
@@ -684,26 +720,11 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 					};
 				}
 
-				if (activeRuns().length >= config.maxConcurrent) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `${config.maxConcurrent} subagents are already running. Wait for one to finish, or raise maxConcurrent in ~/.pi/agent/subagents/config.json.`,
-							},
-						],
-						details: {},
-					};
-				}
+				const busy = tooManyRunning();
+				if (busy) return { content: [{ type: "text" as const, text: busy }], details: {} };
 
-				if (agent.source === "project" && params.confirmProjectAgents !== false && ctx.hasUI && !ctx.isProjectTrusted()) {
-					const ok = await ctx.ui.confirm(
-						"Run a project-local agent?",
-						`Agent: ${agent.name}\nSource: ${agent.filePath}\n\nProject agents come from the repository. Only continue for trusted code.`,
-					);
-					if (!ok) {
-						return { content: [{ type: "text" as const, text: "Cancelled: project agent was not approved." }], details: {} };
-					}
+				if (params.confirmProjectAgents !== false && !(await approveProjectAgent(agent, ctx))) {
+					return { content: [{ type: "text" as const, text: "Cancelled: project agent was not approved." }], details: {} };
 				}
 
 				const name = registry.allocate(params.name?.trim() || agent.name);
@@ -840,7 +861,8 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 					};
 				}
 
-				const { agents } = describeAgents(ctx.cwd, "both");
+				// Resume the same definition: a same-named agent from the other source is not it.
+				const { agents } = describeAgents(ctx.cwd, record.agentSource ?? "both");
 				const agent = agents.find((candidate) => candidate.name === record.agent);
 				if (!agent) {
 					return {
@@ -852,6 +874,13 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 						],
 						details: {},
 					};
+				}
+
+				const busy = tooManyRunning();
+				if (busy) return { content: [{ type: "text" as const, text: busy }], details: {} };
+
+				if (!(await approveProjectAgent(agent, ctx))) {
+					return { content: [{ type: "text" as const, text: "Cancelled: project agent was not approved." }], details: {} };
 				}
 
 				const resumeCwd = record.cwd && fs.existsSync(record.cwd) ? record.cwd : ctx.cwd;
@@ -923,7 +952,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 						base: params.base,
 						fetch: params.fetch,
 						dryRun: params.dryRun,
-						isActive: (worktreePath) => activeRuns().some((run) => run.cwd === worktreePath),
+						isActive: isWorktreeActive,
 					});
 					return { content: [{ type: "text" as const, text: cleanupSummary(result) }], details: result };
 				} catch (error) {
@@ -940,97 +969,97 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 			},
 		});
 
-	pi.registerTool({
-		name: "subagents_list",
-		label: "List subagents",
-		description: "List running and remembered subagents, plus the agent definitions that can be spawned.",
-		parameters: Type.Object({
-			includeAgents: Type.Optional(Type.Boolean({ description: "Also list available agent definitions. Default: true" })),
-		}),
+		pi.registerTool({
+			name: "subagents_list",
+			label: "List subagents",
+			description: "List running and remembered subagents, plus the agent definitions that can be spawned.",
+			parameters: Type.Object({
+				includeAgents: Type.Optional(Type.Boolean({ description: "Also list available agent definitions. Default: true" })),
+			}),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			rememberCtx(ctx);
-			const lines: string[] = [];
-			const active = activeRuns();
-			if (active.length === 0) {
-				lines.push("Running: none");
-			} else {
-				lines.push(`Running (${active.length}):`);
-				for (const run of active) {
-					const elapsed = formatDuration(Date.now() - run.startedAt);
-					const idle = formatDuration(Date.now() - run.lastActivityAt);
-					lines.push(
-						`  ${run.name} (${run.agent}) ${run.status} · ${run.activity} · ${runInfo(run)} · ${elapsed} · idle ${idle}`,
-					);
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				rememberCtx(ctx);
+				const lines: string[] = [];
+				const active = activeRuns();
+				if (active.length === 0) {
+					lines.push("Running: none");
+				} else {
+					lines.push(`Running (${active.length}):`);
+					for (const run of active) {
+						const elapsed = formatDuration(Date.now() - run.startedAt);
+						const idle = formatDuration(Date.now() - run.lastActivityAt);
+						lines.push(
+							`  ${run.name} (${run.agent}) ${run.status} · ${run.activity} · ${runInfo(run)} · ${elapsed} · idle ${idle}`,
+						);
+					}
 				}
-			}
 
-			const finished = registry.list().filter((record) => !runs.has(record.name));
-			if (finished.length > 0) {
-				lines.push("", `Remembered (${finished.length}):`);
-				for (const record of finished.slice(0, 12)) {
-					const worktree = record.worktreePath
-						? record.worktreeRemoved
-							? " · worktree removed"
-							: ` · worktree ${record.worktreePath}`
-						: "";
-					lines.push(
-						`  ${record.name} (${record.agent}) ${record.status}${record.sessionId ? " · resumable" : ""}${worktree} · ${record.task.replace(/\s+/g, " ").slice(0, 60)}`,
-					);
+				const finished = registry.list().filter((record) => !runs.has(record.name));
+				if (finished.length > 0) {
+					lines.push("", `Remembered (${finished.length}):`);
+					for (const record of finished.slice(0, 12)) {
+						const worktree = record.worktreePath
+							? record.worktreeRemoved
+								? " · worktree removed"
+								: ` · worktree ${record.worktreePath}`
+							: "";
+						lines.push(
+							`  ${record.name} (${record.agent}) ${record.status}${record.sessionId ? " · resumable" : ""}${worktree} · ${record.task.replace(/\s+/g, " ").slice(0, 60)}`,
+						);
+					}
 				}
-			}
 
-			if (params.includeAgents !== false) {
-				const { agents } = describeAgents(ctx.cwd, "both");
-				lines.push("", "Agents:");
-				for (const agent of agents) {
-					const bits = [agent.model ?? "default model", agent.tools ? agent.tools.join(",") : "default tools"];
-					lines.push(`  ${agent.name} (${agent.source}): ${agent.description} [${bits.join(" · ")}]`);
+				if (params.includeAgents !== false) {
+					const { agents } = describeAgents(ctx.cwd, "both");
+					lines.push("", "Agents:");
+					for (const agent of agents) {
+						const bits = [agent.model ?? "default model", agent.tools ? agent.tools.join(",") : "default tools"];
+						lines.push(`  ${agent.name} (${agent.source}): ${agent.description} [${bits.join(" · ")}]`);
+					}
 				}
-			}
 
-			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: {} };
-		},
-	});
+				return { content: [{ type: "text" as const, text: lines.join("\n") }], details: {} };
+			},
+		});
 
-	pi.registerCommand("subagents", {
-		description: "List subagents, cancel one, or clean merged worktrees: /subagents [cancel <name>|cleanup [base]]",
-		handler: async (args, ctx) => {
-			rememberCtx(ctx);
-			const trimmed = args.trim();
-			if (trimmed === "cleanup" || trimmed.startsWith("cleanup ")) {
-				const base = trimmed.replace(/^cleanup\s*/, "").trim() || undefined;
-				try {
-					const result = cleanupWorktrees({ cwd: ctx.cwd, base });
-					ctx.ui.notify(cleanupSummary(result), "info");
-				} catch (error) {
-					ctx.ui.notify(`Cleanup failed: ${error instanceof WorktreeError ? error.message : String(error)}`, "error");
-				}
-				return;
-			}
-			if (trimmed.startsWith("cancel")) {
-				const name = trimmed.replace(/^cancel\s*/, "").trim();
-				const run = name ? runs.get(name) : undefined;
-				if (!run || run.isTerminal) {
-					ctx.ui.notify(`No running subagent named "${name}".`, "warning");
+		pi.registerCommand("subagents", {
+			description: "List subagents, cancel one, or clean merged worktrees: /subagents [cancel <name>|cleanup [base]]",
+			handler: async (args, ctx) => {
+				rememberCtx(ctx);
+				const trimmed = args.trim();
+				if (trimmed === "cleanup" || trimmed.startsWith("cleanup ")) {
+					const base = trimmed.replace(/^cleanup\s*/, "").trim() || undefined;
+					try {
+						const result = cleanupWorktrees({ cwd: ctx.cwd, base, isActive: isWorktreeActive });
+						ctx.ui.notify(cleanupSummary(result), "info");
+					} catch (error) {
+						ctx.ui.notify(`Cleanup failed: ${error instanceof WorktreeError ? error.message : String(error)}`, "error");
+					}
 					return;
 				}
-				void run.cancel("cancelled from /subagents");
-				ctx.ui.notify(`Stopping "${name}".`, "info");
-				return;
-			}
+				if (trimmed.startsWith("cancel")) {
+					const name = trimmed.replace(/^cancel\s*/, "").trim();
+					const run = name ? runs.get(name) : undefined;
+					if (!run || run.isTerminal) {
+						ctx.ui.notify(`No running subagent named "${name}".`, "warning");
+						return;
+					}
+					void run.cancel("cancelled from /subagents");
+					ctx.ui.notify(`Stopping "${name}".`, "info");
+					return;
+				}
 
-			const active = activeRuns();
-			if (active.length === 0) {
-				ctx.ui.notify("No subagents running.", "info");
-				return;
-			}
-			const lines = active.map((run) => {
-				const elapsed = formatDuration(Date.now() - run.startedAt);
-				return `${run.name} (${run.agent}) ${run.status} · ${run.activity} · ${elapsed}`;
-			});
-			ctx.ui.notify(lines.join("\n"), "info");
-		},
-	});
+				const active = activeRuns();
+				if (active.length === 0) {
+					ctx.ui.notify("No subagents running.", "info");
+					return;
+				}
+				const lines = active.map((run) => {
+					const elapsed = formatDuration(Date.now() - run.startedAt);
+					return `${run.name} (${run.agent}) ${run.status} · ${run.activity} · ${elapsed}`;
+				});
+				ctx.ui.notify(lines.join("\n"), "info");
+			},
+		});
 	}
 }

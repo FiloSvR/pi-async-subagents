@@ -231,7 +231,7 @@ shows what would go.
 ```bash
 npm install                    # TypeScript and @types/node; host packages are peers
 ./setup-node-modules.sh        # link the host Pi packages for the tests
-npm run check                  # typecheck + 57 tests, no model calls, no API keys
+npm run check                  # typecheck + 63 tests, no model calls, no API keys
 ```
 
 The tests use a scripted fake RPC child (`test/fake-pi.mjs`), not a model, so

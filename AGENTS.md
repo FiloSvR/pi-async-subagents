@@ -4,7 +4,7 @@ A Pi package: async, liveness-checked subagents. The extension runs inside Pi;
 the host supplies `@earendil-works/pi-coding-agent`,
 `@earendil-works/pi-tui`, and `typebox` (peer `*`), never a physical copy.
 
-- Test first. `npm run check` (typecheck + 57 offline tests) must be green.
+- Test first. `npm run check` (typecheck + 63 offline tests) must be green.
 - The tests use a scripted fake RPC child; no model, no API keys.
 - Keep the Pi surface small and listed in `docs/compat.md`. An upgrade diffs
   it, bumps the tested version, runs the checks and `npm run smoke`, then tags.
